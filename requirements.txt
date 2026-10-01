@@ -1,0 +1,13 @@
+# Main ML framework additions
+monai[all]==1.5.1
+
+# Upgrade pyarrow to a NumPy 2.x compatible build (base container ships an old ABI-incompatible version)
+pyarrow>=14.0
+
+# Pipeline-specific packages not provided by the base container
+pandas
+pydicom
+dcm2niix==1.0.20250506
+idc-index
+pyyaml
+tomli; python_version < "3.11"

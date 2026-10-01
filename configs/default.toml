@@ -1,0 +1,84 @@
+# Unified dataset run — LIDC-IDRI + NSCLC-Radiomics + NLST-Radiologist + NLST-AI
+#
+# All datasets share a single output directory so that ct_3d/,
+# nodule_inst_seg_3d/, roi_sem_seg_2d/, etc. contain samples from every
+# dataset side by side, ready for a unified train/val/test split.
+#
+# LIDC-IDRI has no lung annotations so it only contributes to the nodule
+# and CT 3-D outputs; the other datasets also produce 2-D ROI slices.
+
+[defaults]
+# Paths
+raw_data_path       = "../data/raw"
+processed_data_path = "../data/processed"
+save_path           = "../data/processed/unified"  # overrides processed_data_path/<dataset> when set
+
+# Output — comma-separated: nodule, lung, roi
+output = "nodule"
+# Save format — comma-separated: numpy, nifti
+save_format = "numpy"
+compress    = false
+# Label type — comma-separated: semantic, instance
+label_type = "semantic"
+# Save mode — global fallback; comma-separated: 3d, 2d
+save_mode        = "3d"
+nodule_save_mode = "3d"    # overrides save_mode for nodule output
+# lung_save_mode = "3d"    # overrides save_mode for lung output  (omit = use save_mode)
+# roi_save_mode  = "3d"    # overrides save_mode for roi output   (omit = use save_mode)
+
+# Execution
+sync          = true   # sync/download raw data before processing
+download_only = false  # download only, skip processing
+reprocess     = false  # reprocess even if output files already exist
+cpu           = true   # force CPU; automatically true when viewer is set
+# workers     = 1      # parallel workers; defaults to number of GPUs (min 1)
+viewer        = false  # launch interactive viewer instead of writing files
+
+# HU windowing applied before normalisation
+hu_clip_min = -1000.0
+hu_clip_max  =   400.0
+
+# Nodule filtering — each filter is independent and optional
+# Volume (mm³ ≈ voxel count after 1×1×1 mm resampling; use -inf / inf to disable a bound)
+volume_filter = true
+volume_min    = 5.0
+volume_max    = inf
+# Mean HU of the component (raw HU units; use -inf / inf to disable a bound)
+hu_filter = false
+hu_min    = -inf
+hu_max    =  inf
+# Shannon entropy in bits (use -inf / inf to disable a bound)
+entropy_filter = false
+entropy_min    = -inf
+entropy_max    =  inf
+
+# Morphological / crop hyperparameters
+lung_dilations = 0      # dilation iterations on lung mask (0 = disabled)
+roi_crop       = false  # crop volume to the lung/nodule bounding box
+roi_padding    = 1      # voxels of padding around the ROI crop bounding box
+
+# Nodule catalog output path (defaults to <save_path>/nodule_catalog.csv)
+# catalog_path = "../data/processed/unified/nodule_catalog.csv"
+
+# LIDC-IDRI: nodule annotations only (no lung segmentation available)
+[[runs]]
+dataset = "lidc_idri"
+output  = "nodule"
+
+# NSCLC-Radiomics: full pipeline — nodule (3-D) + ROI (2-D slices)
+[[runs]]
+dataset       = "nsclc_radiomics"
+output        = "nodule,roi"
+roi_save_mode = "2d"
+
+# NLST-Radiologist: radiologist-curated annotations — same pipeline as NSCLC-Radiomics
+[[runs]]
+dataset       = "nlst_radiologist"
+output        = "nodule,roi"
+roi_save_mode = "2d"
+
+# NLST-AI: AI-generated annotations — same pipeline as NSCLC-Radiomics
+[[runs]]
+dataset       = "nlst_ai"
+output        = "nodule,roi"
+roi_save_mode = "2d"
