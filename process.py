@@ -42,6 +42,7 @@ import logging.handlers
 import multiprocessing as mp
 import os
 import traceback
+from collections import Counter
 from datetime import datetime
 from multiprocessing import current_process
 
@@ -55,6 +56,7 @@ from ct_data_management.acquisition import (
     NLST_RADIOLOGIST_INFO,
     NLST_AI_INFO,
 )
+from ct_data_management.datasets import dataset_priority
 from ct_data_management.processing.pipeline import PipelineStack
 from ct_data_management.processing.readers import DICOMFileSystemReader
 from ct_data_management.processing.transforms import (
@@ -67,6 +69,7 @@ from ct_data_management.processing.transforms import (
     MergeSegmentsTransform,
     HUClipAndNormTransform,
     NoduleStatsTransform,
+    RequireNodulesTransform,
     NoduleVolumeFilterTransform,
     NoduleHUFilterTransform,
     NoduleEntropyFilterTransform,
@@ -74,7 +77,14 @@ from ct_data_management.processing.transforms import (
     ToDeviceTransform,
     NoduleInstanceSegTransform,
 )
-from ct_data_management.processing.writers import NPZWriter, NIfTIWriter, NoduleCatalogWriter
+from ct_data_management.processing.writers import (
+    NPZWriter,
+    NIfTIWriter,
+    NoduleCatalogWriter,
+    assemble_catalog,
+    catalog_part_path,
+    remove_catalog_part,
+)
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
 
@@ -199,6 +209,7 @@ def build_pipeline(
     # filters and the catalog writer share a single connected-component analysis.
     if has_nodule:
         parts.append(NoduleStatsTransform(hu_clip_min=hu_clip_min, hu_clip_max=hu_clip_max))
+        parts.append(RequireNodulesTransform())
 
         if volume_filter:
             parts.append(NoduleVolumeFilterTransform(min_volume=volume_min, max_volume=volume_max))
@@ -370,6 +381,40 @@ def already_processed(save_path: str, series_id: str, outputs: list,
     return True
 
 
+def order_runs(cfgs: list) -> list:
+    """Sort run configs by dataset priority (stable for runs of equal priority).
+
+    Runs must execute in priority order for ``claim_series`` to give each CT
+    series to the highest-priority dataset that annotates it.
+    """
+    return sorted(cfgs, key=lambda cfg: dataset_priority(cfg.get('dataset', '')))
+
+
+def claim_series(owners: dict, dataset: str, all_paths: list) -> tuple[list, Counter]:
+    """Keep the CT series of ``all_paths`` that no earlier run has claimed.
+
+    ``owners`` maps series UID → dataset and is shared by all runs writing to the
+    same output directory.  Because runs execute in priority order, a series that
+    appears in several manifests — an NLST scan with both a radiologist-corrected
+    and an AI-generated annotation — is processed exactly once, by the
+    highest-priority dataset, instead of being overwritten by a later run.
+
+    Ownership follows the manifests, not the processing outcome: if the owning run
+    fails on a series, the series is not handed to a lower-priority dataset.
+
+    Returns the owned (ct_path, seg_path_list) pairs and a Counter of the series
+    left to other datasets, keyed by the owning dataset.
+    """
+    owned, deferred = [], Counter()
+    for ct_path, seg_path_list in all_paths:
+        owner = owners.setdefault(os.path.basename(ct_path), dataset)
+        if owner == dataset:
+            owned.append((ct_path, seg_path_list))
+        else:
+            deferred[owner] += 1
+    return owned, deferred
+
+
 # --- Config ---
 
 DEFAULTS = {
@@ -410,10 +455,10 @@ DEFAULTS = {
     'hu_clip_min':         -1000.0,
     'hu_clip_max':         400.0,
     # Nodule catalog output path. Defaults to <save_path>/nodule_catalog.csv.
-    # Note: the catalog is only written for series that are processed in the
-    # current run. Series skipped by the already_processed() check (reprocess=false)
-    # will not appear in the catalog. To rebuild a catalog from scratch, delete
-    # the catalog file and re-run with reprocess=true.
+    # Each processed series writes its rows to <catalog>_parts/<series_uid>.csv;
+    # the catalog itself is rebuilt from these fragments at the end of every
+    # invocation and covers all series owned by its runs, including series
+    # skipped by the already_processed() check (reprocess=false).
     'catalog_path':        None,
 }
 
@@ -443,7 +488,15 @@ def _to_list(val) -> list:
 
 # --- Run ---
 
-def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
+def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) -> dict | None:
+    """Process one run.
+
+    ``owners_by_path`` maps an absolute save path to the series → dataset
+    ownership shared by all runs writing there (see ``claim_series``).
+
+    Returns ``{'catalog_path': ..., 'series': [...]}`` with the series owned by
+    this run when it maintains a nodule catalog, otherwise ``None``.
+    """
     VALID_OUTPUTS      = {'nodule', 'lung', 'roi'}
     VALID_SAVE_MODES   = {'3d', '2d'}
     VALID_SAVE_FORMATS = {'numpy', 'nifti'}
@@ -515,7 +568,8 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
 
     data_manager = IDCFileSystemDataManager(raw_path, DATASET_CONFIGS[dataset])
 
-    catalog_path = cfg['catalog_path'] or os.path.join(save_path, 'nodule_catalog.csv')
+    catalog_path   = cfg['catalog_path'] or os.path.join(save_path, 'nodule_catalog.csv')
+    catalog_active = 'nodule' in outputs and not cfg['viewer']
 
     pipeline_kwargs = dict(
         save_path=save_path,
@@ -571,10 +625,14 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
         logger.info('Download complete. Skipping processing (download_only: true).')
         if n_workers > 1:
             listener.stop()
-        return
+        return None
 
-    all_paths = list(data_manager.get_paths())
-    n_total   = len(all_paths)
+    owners = owners_by_path.setdefault(os.path.abspath(save_path), {})
+    all_paths, deferred = claim_series(owners, dataset, list(data_manager.get_paths()))
+    for owner, n in sorted(deferred.items()):
+        logger.info(f'{n} series are also annotated by higher-priority dataset "{owner}" '
+                    f'and are processed there, not as "{dataset}".')
+    n_total = len(all_paths)
 
     if not cfg['reprocess']:
         tasks = [
@@ -596,6 +654,23 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
     n_processed = n_failed = 0
 
     logger.info(f'Found {n_total} CT series. {n_skipped} already processed, {n_tasks} to run.')
+
+    if catalog_active:
+        # A series processed now gets a fresh catalog fragment; removing the old
+        # one first means a series that fails or is dropped leaves no stale rows.
+        for ct_path, _ in tasks:
+            remove_catalog_part(catalog_path, os.path.basename(ct_path))
+
+        task_ids = {os.path.basename(p) for p, _ in tasks}
+        no_part  = [uid for uid in (os.path.basename(p) for p, _ in all_paths)
+                    if uid not in task_ids
+                    and not os.path.exists(catalog_part_path(catalog_path, uid))]
+        if no_part:
+            logger.warning(
+                f'{len(no_part)} already-processed series have no nodule catalog fragment '
+                f'(written by an older pipeline version?) and will be missing from the catalog. '
+                f'Re-run with "reprocess: true" or into an empty save_path.'
+            )
 
     if n_workers > 1:
         pool_init_args = (n_gpus, log_queue, pipeline_kwargs)
@@ -632,6 +707,11 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
         f'Skipped: {n_skipped}  Failed: {n_failed}'
     )
 
+    if catalog_active:
+        return {'catalog_path': catalog_path,
+                'series': [os.path.basename(p) for p, _ in all_paths]}
+    return None
+
 
 # --- Entry point ---
 
@@ -653,9 +733,27 @@ def main():
     mp.set_start_method('spawn', force=True)
     torch.set_grad_enabled(False)
 
-    for i, run_override in enumerate(runs):
-        cfg = {**DEFAULTS, **global_defaults, **run_override}
-        run_one(cfg, run_index=i, total_runs=len(runs))
+    cfgs    = [{**DEFAULTS, **global_defaults, **run_override} for run_override in runs]
+    ordered = order_runs(cfgs)
+    if ordered != cfgs:
+        print('Runs reordered by dataset priority: '
+              + ', '.join(str(cfg.get('dataset')) for cfg in ordered))
+
+    owners_by_path = {}   # save path → {series_uid: owning dataset}
+    catalogs       = {}   # catalog path → series owned by the runs that write it
+    for i, cfg in enumerate(ordered):
+        result = run_one(cfg, run_index=i, total_runs=len(ordered), owners_by_path=owners_by_path)
+        if result is not None:
+            catalogs.setdefault(result['catalog_path'], []).extend(result['series'])
+
+    logger = logging.getLogger('pipeline')
+    for catalog_path, series in catalogs.items():
+        summary = assemble_catalog(catalog_path, series)
+        logger.info(f'Nodule catalog written to {catalog_path}: {summary["rows"]} nodules '
+                    f'in {summary["series"]} series.')
+        if summary['missing']:
+            logger.info(f'{len(summary["missing"])} series have no catalog rows '
+                        f'(dropped by the nodule checks or failed; see the run logs).')
 
 
 if __name__ == '__main__':

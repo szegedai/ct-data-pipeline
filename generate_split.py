@@ -5,11 +5,26 @@ The catalog is produced automatically by the processing pipeline (via
 NoduleCatalogWriter) and contains one row per nodule with columns:
   patient_id, series_uid, dataset, volume_mm3, entropy
 
-Test set eligibility:
+Test set eligibility (scan level):
   - lidc_idri        all scans
   - nsclc_radiomics  all scans
-  - nlst_radiologist all scans (hard cap: 102)
-  - nlst_ai          training only
+  - nlst_radiologist all scans (hard cap: 102 patients)
+  - nlst_ai          never in the test set
+
+A patient is test-eligible if at least one of their scans is.  When an eligible
+patient is drawn for the test set, their eligible scans go to the test set and
+their remaining scans (AI-only NLST scans of a patient who also has a
+radiologist-corrected scan) are marked 'excluded': they belong to neither split,
+which keeps the test labels radiologist-derived and the split patient-isolated.
+The volume/entropy statistics used for stratification are computed from the
+eligible scans only.
+
+Every scan must carry a single dataset label in the catalog; the processing
+pipeline guarantees this by processing each CT series in one dataset only.
+
+Output columns: series_uid, patient_id, dataset, split (train | test | excluded).
+Given the same catalog, the split is identical across runs: the catalog is
+sorted before sampling, so it does not depend on the order of its rows.
 
 Stratification uses a 4 × 4 × 3 cell grid:
   axis 0 — median nodule volume quartile (4 bins)
@@ -27,7 +42,7 @@ down to sum to exactly 102 and the freed slots are redistributed
 proportionally to the non-NLST cells.
 
 Sampling is done at the patient level so no patient appears in both
-splits.
+the training and the test split.
 
 Usage:
     python generate_split.py nodule_catalog.csv
@@ -41,34 +56,55 @@ import sys
 import numpy as np
 import pandas as pd
 
+from ct_data_management.datasets import TEST_ELIGIBLE_DATASETS, dataset_priority
+
 _logger = logging.getLogger('generate_split')
 
-TEST_ELIGIBLE_DATASETS = {'lidc_idri', 'nsclc_radiomics', 'nlst_radiologist'}
 NLST_RADIOLOGIST_CAP   = 102
 BALANCE_WARNING_SIZE   = 3 * NLST_RADIOLOGIST_CAP   # 306
 
 N_QUANTILE_BINS = 4
-
-# Lower value = higher priority. Determines the dataset label assigned to a patient
-# when they appear in multiple datasets (e.g. an NLST subject with both a
-# radiologist-read and an AI-read scan).
-_DATASET_PRIORITY: dict[str, int] = {
-    'nlst_radiologist': 0,
-    'lidc_idri':        1,
-    'nsclc_radiomics':  2,
-    'nlst_ai':          3,
-}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _read_catalog(catalog_csv: str) -> pd.DataFrame:
+    """Read and sanity-check the nodule catalog; return it sorted by scan."""
+    catalog = pd.read_csv(catalog_csv, dtype={'patient_id': str, 'series_uid': str, 'dataset': str})
+    required = {'patient_id', 'series_uid', 'dataset', 'volume_mm3', 'entropy'}
+    missing  = required - set(catalog.columns)
+    if missing:
+        raise ValueError(f'Catalog is missing columns: {missing}')
+
+    if catalog[['patient_id', 'series_uid', 'dataset']].isna().any().any() \
+            or (catalog['patient_id'].str.strip() == '').any():
+        raise ValueError('Catalog has rows without patient_id, series_uid or dataset.')
+
+    labels = catalog.groupby('series_uid')['dataset'].nunique()
+    if (labels > 1).any():
+        bad = labels[labels > 1].index.tolist()
+        raise ValueError(
+            f'{len(bad)} series carry more than one dataset label (e.g. {bad[:3]}). '
+            f'Each CT series must be catalogued by exactly one dataset; '
+            f're-run process.py, which processes every series in a single dataset.'
+        )
+
+    patients = catalog.groupby('series_uid')['patient_id'].nunique()
+    if (patients > 1).any():
+        raise ValueError('Some series are assigned to more than one patient_id.')
+
+    # Sorting makes the sampling below independent of the catalog's row order,
+    # which depends on the order in which parallel workers finished.
+    return catalog.sort_values(['series_uid', 'volume_mm3', 'entropy'], kind='mergesort')
+
+
 def _aggregate_to_scan(catalog: pd.DataFrame) -> pd.DataFrame:
     """Collapse one-row-per-nodule catalog to one row per scan."""
     return (
         catalog
-        .groupby('series_uid', sort=False)
+        .groupby('series_uid', sort=True)
         .agg(
             patient_id    = ('patient_id',  'first'),
             dataset       = ('dataset',     'first'),
@@ -82,11 +118,11 @@ def _aggregate_to_scan(catalog: pd.DataFrame) -> pd.DataFrame:
 def _aggregate_to_patient(per_scan: pd.DataFrame) -> pd.DataFrame:
     """Collapse to one row per patient (handles multi-scan patients)."""
     def _priority_dataset(datasets: pd.Series) -> str:
-        return min(datasets, key=lambda d: _DATASET_PRIORITY.get(d, 99))
+        return min(datasets, key=dataset_priority)
 
     return (
         per_scan
-        .groupby('patient_id', sort=False)
+        .groupby('patient_id', sort=True)
         .agg(
             dataset       = ('dataset',       _priority_dataset),
             median_volume = ('median_volume', 'median'),
@@ -115,11 +151,7 @@ def generate_split(
     output: str = 'split.csv',
 ) -> pd.DataFrame:
 
-    catalog = pd.read_csv(catalog_csv)
-    required = {'patient_id', 'series_uid', 'dataset', 'volume_mm3', 'entropy'}
-    missing  = required - set(catalog.columns)
-    if missing:
-        raise ValueError(f'Catalog is missing columns: {missing}')
+    catalog = _read_catalog(catalog_csv)
 
     if test_size > BALANCE_WARNING_SIZE:
         _logger.warning(
@@ -131,12 +163,12 @@ def generate_split(
 
     rng = np.random.default_rng(seed)
 
-    # --- Aggregate catalog rows to one row per patient ---
-    per_scan    = _aggregate_to_scan(catalog)
-    per_patient = _aggregate_to_patient(per_scan)
+    # --- Aggregate catalog rows to one row per scan ---
+    per_scan = _aggregate_to_scan(catalog)
+    per_scan.loc[:, 'eligible'] = per_scan['dataset'].isin(TEST_ELIGIBLE_DATASETS)
 
-    # --- Restrict to test-eligible patients ---
-    eligible = per_patient[per_patient['dataset'].isin(TEST_ELIGIBLE_DATASETS)].copy()
+    # --- Test-eligible patients, described by their eligible scans only ---
+    eligible = _aggregate_to_patient(per_scan[per_scan['eligible']])
     if eligible.empty:
         raise ValueError('No test-eligible patients found in the catalog.')
 
@@ -211,19 +243,29 @@ def generate_split(
     for ds, grp in selected_patients.groupby('dataset', observed=True):
         _logger.info('Test set — %s: %d patients', ds, len(grp))
 
-    # --- Assign split to every scan (including nlst_ai and non-selected scans) ---
-    per_scan.loc[:, 'split'] = per_scan['patient_id'].apply(
-        lambda pid: 'test' if pid in test_patient_set else 'train'
+    # --- Assign a split to every scan ---
+    # Scans of test patients go to the test set only if they are test-eligible;
+    # the others (AI-only scans) are excluded so that they appear in neither split.
+    in_test = per_scan['patient_id'].isin(test_patient_set)
+    per_scan.loc[:, 'split'] = np.where(
+        ~in_test, 'train', np.where(per_scan['eligible'], 'test', 'excluded')
     )
 
     result = per_scan[['series_uid', 'patient_id', 'dataset', 'split']]
     result.to_csv(output, index=False)
+
+    counts = result['split'].value_counts()
     _logger.info(
-        'Split saved to %s  (test: %d  train: %d)',
-        output,
-        (result['split'] == 'test').sum(),
-        (result['split'] == 'train').sum(),
+        'Split saved to %s  (test: %d  train: %d  excluded: %d scans)',
+        output, counts.get('test', 0), counts.get('train', 0), counts.get('excluded', 0),
     )
+    excluded = result[result['split'] == 'excluded']
+    if not excluded.empty:
+        _logger.info(
+            'Excluded %d non-eligible scan(s) of %d test patient(s) (%s).',
+            len(excluded), excluded['patient_id'].nunique(),
+            ', '.join(f'{ds}: {n}' for ds, n in excluded['dataset'].value_counts().items()),
+        )
     return result
 
 

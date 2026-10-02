@@ -1,6 +1,5 @@
 from pathlib import Path
 import csv
-import fcntl
 import os
 import numpy as np
 import nibabel as nib
@@ -226,18 +225,76 @@ class NIfTIWriter(PipelinePart):
 _CATALOG_COLUMNS = ['patient_id', 'series_uid', 'dataset', 'volume_mm3', 'entropy']
 
 
+def catalog_parts_dir(catalog_path: str) -> str:
+    """Directory holding the per-series fragments of ``catalog_path``.
+
+    ``<dir>/nodule_catalog.csv`` → ``<dir>/nodule_catalog_parts/``
+    """
+    root, _ = os.path.splitext(catalog_path)
+    return root + '_parts'
+
+
+def catalog_part_path(catalog_path: str, series_uid: str) -> str:
+    return os.path.join(catalog_parts_dir(catalog_path), f'{series_uid}.csv')
+
+
+def remove_catalog_part(catalog_path: str, series_uid: str) -> None:
+    try:
+        os.remove(catalog_part_path(catalog_path, series_uid))
+    except FileNotFoundError:
+        pass
+
+
+def assemble_catalog(catalog_path: str, series_uids) -> dict:
+    """Write ``catalog_path`` from the per-series fragments of ``series_uids``.
+
+    Rows are ordered by series UID (and by component order within a series), so
+    the catalogue — and therefore the split generated from it — does not depend
+    on the order in which parallel workers finished.  Fragments of series that
+    are not listed (for example left over from an earlier run with a different
+    configuration) are ignored.
+
+    Returns ``{'series': n_series_with_rows, 'rows': n_rows, 'missing': [uids]}``
+    where ``missing`` lists requested series without a fragment (series that
+    failed, were dropped, or were never processed with this pipeline version).
+    """
+    rows, missing, n_series = [], [], 0
+    for uid in sorted(series_uids):
+        part = catalog_part_path(catalog_path, uid)
+        if not os.path.exists(part):
+            missing.append(uid)
+            continue
+        with open(part, newline='') as f:
+            part_rows = list(csv.DictReader(f))
+        if part_rows:
+            n_series += 1
+            rows.extend(part_rows)
+
+    Path(catalog_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = catalog_path + '.tmp'
+    with open(tmp, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, catalog_path)
+    return {'series': n_series, 'rows': len(rows), 'missing': missing}
+
+
 class NoduleCatalogWriter(PipelinePart):
-    """Appends per-nodule statistics to a shared CSV catalog after each processed scan.
+    """Records per-nodule statistics of each processed scan for the nodule catalog.
 
     Reads pre-computed per-component statistics from ``params['nodule_components']``
     as populated by ``NoduleStatsTransform``.  Must be placed after that transform
     in the pipeline.
 
-    The CSV is written with an exclusive POSIX file lock so concurrent worker
-    processes can safely append to the same file.
+    Each scan gets its own fragment ``<catalog>_parts/<series_uid>.csv``, which is
+    replaced whenever the scan is processed again.  ``assemble_catalog`` combines
+    the fragments into the final catalog CSV once all runs have finished.  This
+    keeps the catalog free of duplicate rows when scans are re-processed, and
+    needs no locking between worker processes.
 
     Args:
-        catalog_path: Path to the output CSV file.
+        catalog_path: Path of the final catalog CSV (fragments are stored next to it).
         dataset:      Dataset label written into every row ('lidc_idri',
                       'nsclc_radiomics', 'nlst_radiologist', or 'nlst_ai').
     """
@@ -247,11 +304,15 @@ class NoduleCatalogWriter(PipelinePart):
         self._dataset      = dataset
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        series_uid = params.get('id', '')
+        if not series_uid:
+            raise ValueError('No valid id was provided. Ensure IDGenerator runs before NoduleCatalogWriter.')
+
         components = params.get('nodule_components')
         if not components or not components['stats']:
+            remove_catalog_part(self._catalog_path, series_uid)
             return data, params
 
-        series_uid = params.get('id', '')
         patient_id = ''
         ct_header  = params.get('ct_header')
         if ct_header is not None:
@@ -268,21 +329,13 @@ class NoduleCatalogWriter(PipelinePart):
             for s in components['stats']
         ]
 
-        Path(self._catalog_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self._catalog_path, 'a', newline='') as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                # Seek to true end after acquiring the lock — f.tell() at open
-                # time reflects the file size when this process opened it, not
-                # the current size, so two workers opening an empty file would
-                # both see 0 and both write the header without this seek.
-                f.seek(0, 2)
-                writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
-                if f.tell() == 0:
-                    writer.writeheader()
-                writer.writerows(rows)
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        part = catalog_part_path(self._catalog_path, series_uid)
+        Path(part).parent.mkdir(parents=True, exist_ok=True)
+        tmp = f'{part}.{os.getpid()}.tmp'
+        with open(tmp, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, part)
 
         return data, params

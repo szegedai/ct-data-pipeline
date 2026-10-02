@@ -302,6 +302,27 @@ class NoduleStatsTransform(PipelinePart):
         return data, params
 
 
+class RequireNodulesTransform(PipelinePart):
+    """Drop scans whose nodule mask is empty.
+
+    A SEG object can contain a nodule segment whose voxels all disappear when the
+    mask is resampled onto the 1 mm grid (sub-voxel annotations).  Such scans would
+    otherwise be written with an empty nodule mask but without catalog rows, and
+    therefore without a train/test assignment.  They are dropped instead, in the
+    same way as scans whose components are all removed by the nodule filters.
+
+    Must be placed after ``NoduleStatsTransform``.
+
+    Raises ``DataAnomalyError`` if no nodule component is present.
+    """
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        components = params.get('nodule_components')
+        if components is not None and not components['stats']:
+            raise DataAnomalyError('Nodule mask is empty after resampling. Series dropped.')
+        return data, params
+
+
 class NoduleVolumeFilterTransform(PipelinePart):
     """Remove nodule components outside a plausible volume range.
 

@@ -12,9 +12,16 @@ No filters (volume, HU, entropy) are applied so every annotated nodule
 component is recorded, including small artefacts — the point is to analyse
 the full distribution before choosing filter thresholds.
 
+As in process.py, a CT series listed by several runs (an NLST scan with both a
+radiologist-corrected and an AI-generated annotation) is catalogued once, by the
+highest-priority dataset.
+
+The catalog is written to <save_path>/nodule_catalog_unfiltered.csv (or the path
+given with --output), never to the release catalog maintained by process.py.
+
 Usage:
     python catalog_nodules.py configs/default.toml
-    python catalog_nodules.py configs/default.yaml
+    python catalog_nodules.py configs/default.yaml --output unfiltered.csv
 '''
 
 import argparse
@@ -38,8 +45,19 @@ from ct_data_management.processing.transforms import (
     HUClipAndNormTransform,
     NoduleStatsTransform,
 )
-from ct_data_management.processing.writers import NoduleCatalogWriter
-from process import load_config, DEFAULTS, DATASET_CONFIGS, DATASET_SEG_CONFIGS
+from ct_data_management.processing.writers import (
+    NoduleCatalogWriter,
+    assemble_catalog,
+    remove_catalog_part,
+)
+from process import (
+    load_config,
+    order_runs,
+    claim_series,
+    DEFAULTS,
+    DATASET_CONFIGS,
+    DATASET_SEG_CONFIGS,
+)
 
 
 def build_pipeline(
@@ -68,7 +86,8 @@ def build_pipeline(
     ])
 
 
-def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
+def run_one(cfg: dict, run_index: int, total_runs: int,
+            owners_by_path: dict, output: str | None) -> dict | None:
     logger = logging.getLogger('catalog_nodules')
 
     dataset = cfg.get('dataset')
@@ -82,7 +101,7 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
 
     raw_path  = os.path.join(cfg['raw_data_path'], dataset)
     save_path = cfg['save_path'] or os.path.join(cfg['processed_data_path'], dataset)
-    catalog_path = cfg['catalog_path'] or os.path.join(save_path, 'nodule_catalog.csv')
+    catalog_path = output or os.path.join(save_path, 'nodule_catalog_unfiltered.csv')
     hu_clip_min  = cfg['hu_clip_min']
     hu_clip_max  = cfg['hu_clip_max']
 
@@ -99,9 +118,13 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
 
     if cfg.get('download_only'):
         logger.info('Download complete. Skipping processing (download_only: true).')
-        return
+        return None
 
-    all_paths    = list(data_manager.get_paths())
+    owners = owners_by_path.setdefault(os.path.abspath(catalog_path), {})
+    all_paths, deferred = claim_series(owners, dataset, list(data_manager.get_paths()))
+    for owner, n in sorted(deferred.items()):
+        logger.info('%d series are also annotated by higher-priority dataset "%s" '
+                    'and are catalogued there, not as "%s".', n, owner, dataset)
     logger.info('Found %d CT series.', len(all_paths))
 
     pipeline = build_pipeline(
@@ -114,6 +137,7 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
     n_ok = n_fail = 0
     for ct_path, seg_path_list in tqdm(all_paths, total=len(all_paths)):
         series_id = os.path.basename(ct_path)
+        remove_catalog_part(catalog_path, series_id)
         try:
             pipeline({'ct': ct_path, 'seg_list': seg_path_list}, {})
             n_ok += 1
@@ -123,6 +147,8 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
             logger.debug(traceback.format_exc())
 
     logger.info('Done. OK: %d  Failed: %d', n_ok, n_fail)
+    return {'catalog_path': catalog_path,
+            'series': [os.path.basename(p) for p, _ in all_paths]}
 
 
 def main():
@@ -137,6 +163,8 @@ def main():
         epilog='Uses the same config format as process.py. No nodule filters are applied.',
     )
     parser.add_argument('config', help='Path to a YAML (.yaml/.yml) or TOML (.toml) config file.')
+    parser.add_argument('--output', default=None,
+                        help='Catalog CSV path (default: <save_path>/nodule_catalog_unfiltered.csv)')
     args = parser.parse_args()
 
     raw            = load_config(args.config)
@@ -148,9 +176,22 @@ def main():
 
     torch.set_grad_enabled(False)
 
-    for i, run_override in enumerate(runs):
-        cfg = {**DEFAULTS, **global_defaults, **run_override}
-        run_one(cfg, run_index=i, total_runs=len(runs))
+    cfgs    = [{**DEFAULTS, **global_defaults, **run_override} for run_override in runs]
+    ordered = order_runs(cfgs)
+
+    owners_by_path = {}
+    catalogs       = {}
+    for i, cfg in enumerate(ordered):
+        result = run_one(cfg, run_index=i, total_runs=len(ordered),
+                         owners_by_path=owners_by_path, output=args.output)
+        if result is not None:
+            catalogs.setdefault(result['catalog_path'], []).extend(result['series'])
+
+    logger = logging.getLogger('catalog_nodules')
+    for catalog_path, series in catalogs.items():
+        summary = assemble_catalog(catalog_path, series)
+        logger.info('Catalog written to %s: %d nodules in %d series.',
+                    catalog_path, summary['rows'], summary['series'])
 
 
 if __name__ == '__main__':
