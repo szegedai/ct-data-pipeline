@@ -37,6 +37,7 @@ See configs/ for full YAML and TOML examples with all available options document
 '''
 
 import argparse
+import csv
 import logging
 import logging.handlers
 import multiprocessing as mp
@@ -82,8 +83,12 @@ from ct_data_management.processing.writers import (
     NIfTIWriter,
     NoduleCatalogWriter,
     assemble_catalog,
+    assemble_dropped,
     catalog_part_path,
+    dropped_report_path,
     remove_catalog_part,
+    remove_dropped_part,
+    write_dropped_part,
 )
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
@@ -141,7 +146,8 @@ def _process_series(args):
         logger.error(f'  SEG:  {seg_path_list}')
         logger.error(f'  {type(e).__name__}: {e}')
         logger.debug(traceback.format_exc())
-        return {'series_id': series_id, 'ok': False, 'error': str(e)}
+        return {'series_id': series_id, 'ok': False,
+                'error_type': type(e).__name__, 'error': str(e)}
 
 
 # --- Pipeline builder ---
@@ -479,6 +485,21 @@ def load_config(path: str) -> dict:
     raise SystemExit(f"Unsupported config format '{path}'. Use .yaml, .yml, or .toml.")
 
 
+def parse_overrides(items: list) -> dict:
+    """Parse ``--set KEY=VALUE`` items; values use YAML syntax (``workers=6``, ``sync=false``)."""
+    import yaml
+    overrides = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        key = key.strip()
+        if not sep or not key:
+            raise SystemExit(f'--set expects KEY=VALUE, got "{item}".')
+        if key not in DEFAULTS:
+            raise SystemExit(f'--set: unknown option "{key}". Choose from {sorted(DEFAULTS)}.')
+        overrides[key] = yaml.safe_load(value) if value.strip() else None
+    return overrides
+
+
 def _to_list(val) -> list:
     """Normalise a string or list config value to a deduplicated list."""
     if isinstance(val, list):
@@ -494,8 +515,10 @@ def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) ->
     ``owners_by_path`` maps an absolute save path to the series → dataset
     ownership shared by all runs writing there (see ``claim_series``).
 
-    Returns ``{'catalog_path': ..., 'series': [...]}`` with the series owned by
-    this run when it maintains a nodule catalog, otherwise ``None``.
+    Returns ``{'save_path': ..., 'catalog_path': ... or None, 'series': [...]}``
+    with the series owned by this run (``catalog_path`` is None when the run keeps
+    no nodule catalog), or ``None`` when nothing was processed (download only,
+    viewer).
     """
     VALID_OUTPUTS      = {'nodule', 'lung', 'roi'}
     VALID_SAVE_MODES   = {'3d', '2d'}
@@ -570,6 +593,7 @@ def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) ->
 
     catalog_path   = cfg['catalog_path'] or os.path.join(save_path, 'nodule_catalog.csv')
     catalog_active = 'nodule' in outputs and not cfg['viewer']
+    dropped_path   = dropped_report_path(save_path)
 
     pipeline_kwargs = dict(
         save_path=save_path,
@@ -672,6 +696,16 @@ def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) ->
                 f'Re-run with "reprocess: true" or into an empty save_path.'
             )
 
+    def record_failure(series_id, error_type, error):
+        if not cfg['viewer']:
+            write_dropped_part(dropped_path, series_id, dataset, error_type, error)
+
+    if not cfg['viewer']:
+        # Series processed now get a fresh entry in the dropped-series report if
+        # they fail again, and none if they succeed.
+        for ct_path, _ in tasks:
+            remove_dropped_part(dropped_path, os.path.basename(ct_path))
+
     if n_workers > 1:
         pool_init_args = (n_gpus, log_queue, pipeline_kwargs)
         try:
@@ -681,6 +715,7 @@ def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) ->
                         n_processed += 1
                     else:
                         n_failed += 1
+                        record_failure(result['series_id'], result['error_type'], result['error'])
         except mp.ProcessError as e:
             logger.error(f'Worker process lost: {e}')
         finally:
@@ -701,16 +736,18 @@ def run_one(cfg: dict, run_index: int, total_runs: int, owners_by_path: dict) ->
                 logger.error(f'  SEG:  {seg_path_list}')
                 logger.error(f'  {type(e).__name__}: {e}')
                 logger.debug(traceback.format_exc())
+                record_failure(series_id, type(e).__name__, str(e))
 
     logger.info(
         f'Done. Total: {n_total}  Processed: {n_processed}  '
         f'Skipped: {n_skipped}  Failed: {n_failed}'
     )
 
-    if catalog_active:
-        return {'catalog_path': catalog_path,
-                'series': [os.path.basename(p) for p, _ in all_paths]}
-    return None
+    if cfg['viewer']:
+        return None
+    return {'save_path': save_path,
+            'catalog_path': catalog_path if catalog_active else None,
+            'series': [os.path.basename(p) for p, _ in all_paths]}
 
 
 # --- Entry point ---
@@ -721,11 +758,15 @@ def main():
         epilog='See configs/ for example YAML and TOML configuration files.',
     )
     parser.add_argument('config', help='Path to a YAML (.yaml/.yml) or TOML (.toml) config file.')
+    parser.add_argument('--set', dest='overrides', action='append', default=[], metavar='KEY=VALUE',
+                        help='Override a config option for every run, e.g. --set workers=6 '
+                             '--set save_path=/data/release. Can be repeated.')
     args = parser.parse_args()
 
     raw            = load_config(args.config)
     global_defaults = raw.get('defaults', {})
     runs           = raw.get('runs', [])
+    overrides      = parse_overrides(args.overrides)
 
     if not runs:
         raise SystemExit('Config file must define at least one entry under "runs".')
@@ -733,7 +774,7 @@ def main():
     mp.set_start_method('spawn', force=True)
     torch.set_grad_enabled(False)
 
-    cfgs    = [{**DEFAULTS, **global_defaults, **run_override} for run_override in runs]
+    cfgs    = [{**DEFAULTS, **global_defaults, **run_override, **overrides} for run_override in runs]
     ordered = order_runs(cfgs)
     if ordered != cfgs:
         print('Runs reordered by dataset priority: '
@@ -741,10 +782,13 @@ def main():
 
     owners_by_path = {}   # save path → {series_uid: owning dataset}
     catalogs       = {}   # catalog path → series owned by the runs that write it
+    save_paths     = {}   # save path → series owned by the runs that write there
     for i, cfg in enumerate(ordered):
         result = run_one(cfg, run_index=i, total_runs=len(ordered), owners_by_path=owners_by_path)
         if result is not None:
-            catalogs.setdefault(result['catalog_path'], []).extend(result['series'])
+            save_paths.setdefault(os.path.abspath(result['save_path']), []).extend(result['series'])
+            if result['catalog_path'] is not None:
+                catalogs.setdefault(result['catalog_path'], []).extend(result['series'])
 
     logger = logging.getLogger('pipeline')
     for catalog_path, series in catalogs.items():
@@ -754,6 +798,21 @@ def main():
         if summary['missing']:
             logger.info(f'{len(summary["missing"])} series have no catalog rows '
                         f'(dropped by the nodule checks or failed; see the run logs).')
+
+    for save_path, series in save_paths.items():
+        report_path = dropped_report_path(save_path)
+        summary     = assemble_dropped(report_path, series)
+        logger.info(f'Dropped-series report written to {report_path}: '
+                    f'{summary["rows"]} of {len(series)} series dropped.')
+        with open(report_path, newline='') as f:
+            counts = Counter((row['dataset'], row['reason']) for row in csv.DictReader(f))
+        for (dataset, reason), n in sorted(counts.items()):
+            logger.info(f'  {dataset:<18} {reason:<20} {n}')
+        if any(reason != 'DataAnomalyError' for _, reason in counts):
+            logger.warning('Some series failed for reasons other than the data checks '
+                           '(reason != DataAnomalyError). Re-running the same command '
+                           'retries them; failures caused by the source data are listed '
+                           'in configs/known_failures.csv.')
 
 
 if __name__ == '__main__':

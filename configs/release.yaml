@@ -1,0 +1,83 @@
+# Configuration of the published release (harmonised lung CT dataset).
+#
+# Reproduces the released files from the IDC data release v23 (pinned by
+# idc-index-data==23.3.1 in requirements.txt):
+#
+#   python process.py configs/release.yaml          # download + process (GPU recommended)
+#   python generate_split.py ../data/processed/release/nodule_catalog.csv \
+#       --output ../data/processed/release/split.csv
+#   python validate_release.py ../data/processed/release --raw ../data/raw --check-masks all
+#
+# Only the paths and the execution settings may be changed (on the command line
+# with --set KEY=VALUE, e.g. --set workers=6 --set sync=false); every other value
+# determines the content of the release.  See README.md.
+
+defaults:
+  # Paths
+  raw_data_path: ../data/raw                 # raw DICOM data, one directory per dataset
+  save_path:     ../data/processed/release   # all datasets are written side by side here
+
+  # Execution (does not change the output)
+  sync:          true    # download missing raw data from IDC first; false = use what is on disk
+  download_only: false
+  reprocess:     false   # false: keep series that are already processed (resumes an interrupted run)
+  cpu:           false   # true forces a single CPU worker
+  workers:       null    # parallel workers; null = one per GPU.  Several workers can share
+                         # a GPU: 6 fit on one 94 GB H100 (out-of-memory errors are retried
+                         # by running the command again, see README.md)
+  viewer:        false
+
+  # Output
+  output:           nodule
+  save_format:      numpy
+  compress:         false
+  label_type:       semantic
+  save_mode:        3d
+  nodule_save_mode: 3d
+  lung_save_mode:   null
+  roi_save_mode:    null
+
+  # HU windowing applied before normalisation
+  hu_clip_min: -1000.0
+  hu_clip_max:   400.0
+
+  # Nodule filtering
+  volume_filter:  true
+  volume_min:     5.0    # mm³ (= voxels at the 1 × 1 × 1 mm resampling)
+  volume_max:     .inf
+  hu_filter:      false
+  hu_min:         -.inf
+  hu_max:          .inf
+  entropy_filter: false
+  entropy_min:    -.inf
+  entropy_max:     .inf
+
+  # Morphological / crop hyperparameters
+  lung_dilations: 0
+  roi_crop:       false
+  roi_padding:    1
+
+  catalog_path: null     # <save_path>/nodule_catalog.csv
+
+# A CT series annotated by several datasets is processed once, by the
+# highest-priority one (nlst_radiologist > lidc_idri > nsclc_radiomics > nlst_ai;
+# ct_data_management/datasets.py), whatever the order below.
+runs:
+  # LIDC-IDRI: nodule annotations only (no lung segmentation available)
+  - dataset: lidc_idri
+    output:  nodule
+
+  # NSCLC-Radiomics: nodule (3-D) + ROI (2-D slices)
+  - dataset:       nsclc_radiomics
+    output:        nodule,roi
+    roi_save_mode: 2d
+
+  # NLST, radiologist-corrected annotations
+  - dataset:       nlst_radiologist
+    output:        nodule,roi
+    roi_save_mode: 2d
+
+  # NLST, AI-generated annotations
+  - dataset:       nlst_ai
+    output:        nodule,roi
+    roi_save_mode: 2d

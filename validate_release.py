@@ -3,20 +3,26 @@ Consistency checks for a processed release before it is published.
 
 Checks that the processed files, the nodule catalog and the train/test split
 describe the same set of scans, that the split is patient-isolated and keeps
-non-eligible (AI-only) scans out of the test set, and — optionally — that the
-nodule masks on disk match the catalog and that every scan was processed with
-the annotation of its highest-priority dataset.
+non-eligible (AI-only) scans out of the test set, and that every scan missing
+from the release is listed in the dropped-series report written by process.py,
+either dropped by the data checks or listed in configs/known_failures.csv.
+Optionally, it also checks that the nodule masks on disk match the catalog and,
+against the raw manifests, that every scan was processed with the annotation of
+its highest-priority dataset and is either released or reported as dropped.
 
 Usage:
-    python validate_release.py ../data/processed/unified
-    python validate_release.py ../data/processed/unified --raw ../data/raw --check-masks all --workers 16
+    python validate_release.py ../data/processed/release
+    python validate_release.py ../data/processed/release --raw ../data/raw --check-masks all --workers 16
 
 Arguments:
     data_dir         Directory with ct_3d/, nodule_sem_seg_3d/, ... (the save_path of process.py)
     --split          Split CSV (default: <data_dir>/split.csv)
     --catalog        Nodule catalog CSV (default: <data_dir>/nodule_catalog.csv)
-    --raw            raw_data_path of process.py; enables the dataset ownership check
-                     against the per-dataset manifests
+    --dropped        Dropped-series report (default: <data_dir>/dropped_series.csv)
+    --known-failures Series that fail because of their source data (default:
+                     configs/known_failures.csv next to this script)
+    --raw            raw_data_path of process.py; enables the ownership and
+                     completeness checks against the per-dataset manifests
     --check-masks    'all', a number of randomly chosen scans (always including every
                      nlst_radiologist scan), or 0 to skip (default: 200)
     --min-volume     Smallest nodule volume allowed in the catalog in mm³ (default: 5)
@@ -40,6 +46,9 @@ import pandas as pd
 from ct_data_management.datasets import TEST_ELIGIBLE_DATASETS, dataset_priority
 
 SPLIT_VALUES = {'train', 'test', 'excluded'}
+DATA_CHECK_REASON = 'DataAnomalyError'     # series dropped by the pipeline's data checks
+DEFAULT_KNOWN_FAILURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      'configs', 'known_failures.csv')
 _SLICE_RE    = re.compile(r'^(?P<uid>.+)_(?P<idx>\d{4})\.npz$')
 
 
@@ -276,8 +285,37 @@ def check_masks(rep, data_dir, split, catalog, how, workers, seed=0):
               f'{len(wrong_volume)} masks have different component volumes than the catalog', wrong_volume)
 
 
-def check_ownership(rep, raw_dir, split):
-    print('\nDataset ownership (against the raw manifests)')
+def check_dropped(rep, dropped, known, split):
+    print('\nDropped series (not in the release)')
+    if dropped is None:
+        rep.fail('dropped_series.csv not found (written by process.py; re-run process.py '
+                 'with this pipeline version on the same save_path to create it)')
+        return
+    rep.check(dropped['series_uid'].is_unique, f'one row per dropped scan ({len(dropped)} scans)',
+              'duplicate scans in the dropped-series report',
+              dropped[dropped['series_uid'].duplicated()].series_uid)
+    both = sorted(set(dropped.series_uid) & set(split.series_uid))
+    rep.check(not both, 'no dropped scan is in the release',
+              f'{len(both)} scans are both released and reported as dropped', both)
+
+    other  = dropped[dropped['reason'] != DATA_CHECK_REASON]
+    known_ids = set(known.series_uid)
+    unknown = other[~other['series_uid'].isin(known_ids)]
+    rep.check(unknown.empty,
+              f'every scan dropped for a reason other than the data checks is a known '
+              f'source-data failure ({len(other)} scans)',
+              f'{len(unknown)} scans failed for other reasons (out of memory, I/O, ...): '
+              f're-run process.py with the same config to retry them; a scan that fails '
+              f'because of its source data belongs in configs/known_failures.csv',
+              [f'{r.series_uid} ({r.dataset}): {r.reason}: {r.detail}' for r in unknown.itertuples()])
+
+    counts = dropped.groupby(['dataset', 'reason', 'detail']).size()
+    for (ds, reason, detail), n in sorted(counts.items(), key=lambda kv: (dataset_priority(kv[0][0]), kv[0][1:])):
+        print(f'  info   {ds:17s} {n:4d}  {reason}: {detail[:70]}')
+
+
+def check_ownership(rep, raw_dir, split, dropped):
+    print('\nDataset ownership and completeness (against the raw manifests)')
     owner = {}
     in_manifest = defaultdict(set)
     for ds in sorted({'lidc_idri', 'nsclc_radiomics', 'nlst_radiologist', 'nlst_ai'}, key=dataset_priority):
@@ -299,11 +337,28 @@ def check_ownership(rep, raw_dir, split):
               f'{len(unknown)} released scans are in no manifest', unknown)
     rep.check(not wrong, 'every scan is released under its highest-priority dataset',
               f'{len(wrong)} scans are released under a lower-priority dataset', wrong)
+    if dropped is not None:
+        dropped_ds = dropped.set_index('series_uid')['dataset']
+        d_unknown = [u for u in dropped_ds.index if u not in owner]
+        d_wrong = [f'{u}: reported as {dropped_ds[u]}, highest-priority dataset is {owner[u]}'
+                   for u in dropped_ds.index if u in owner and owner[u] != dropped_ds[u]]
+        rep.check(not d_unknown and not d_wrong,
+                  'every dropped scan was processed under its highest-priority dataset',
+                  f'{len(d_unknown) + len(d_wrong)} dropped scans are in no manifest or were '
+                  f'processed under a lower-priority dataset', d_unknown + d_wrong)
+        accounted = set(labelled.index) | set(dropped_ds.index)
+        missing = sorted(u for u in owner if u not in accounted)
+        rep.check(not missing, f'every manifest scan ({len(owner)}) is either released or reported as dropped',
+                  f'{len(missing)} manifest scans are neither released nor reported as dropped '
+                  f'(not processed, or processed by an older pipeline version)', missing)
+    else:
+        dropped_ds = pd.Series(dtype=str)
     for ds in sorted(in_manifest, key=dataset_priority):
         owned = {u for u in in_manifest[ds] if owner[u] == ds}
         released = owned & set(labelled.index)
+        n_dropped = len(owned & set(dropped_ds.index))
         print(f'  info   {ds:17s} manifest scans: {len(in_manifest[ds]):5d}  owned: {len(owned):5d}  '
-              f'released: {len(released):5d}  not released (dropped/failed): {len(owned - released)}')
+              f'released: {len(released):5d}  dropped: {n_dropped:3d}')
 
 
 def summary(split, catalog, slices):
@@ -332,6 +387,8 @@ def main():
     parser.add_argument('data_dir')
     parser.add_argument('--split', default=None)
     parser.add_argument('--catalog', default=None)
+    parser.add_argument('--dropped', default=None)
+    parser.add_argument('--known-failures', default=DEFAULT_KNOWN_FAILURES)
     parser.add_argument('--raw', default=None)
     parser.add_argument('--check-masks', default='200')
     parser.add_argument('--min-volume', type=float, default=5.0)
@@ -343,15 +400,21 @@ def main():
     dtypes = {'patient_id': str, 'series_uid': str, 'dataset': str}
     split   = pd.read_csv(split_path, dtype={**dtypes, 'split': str})
     catalog = pd.read_csv(catalog_path, dtype=dtypes)
-    print(f'Data:    {args.data_dir}\nSplit:   {split_path}\nCatalog: {catalog_path}')
+    dropped_path = args.dropped or os.path.join(args.data_dir, 'dropped_series.csv')
+    dropped = (pd.read_csv(dropped_path, dtype=str, keep_default_na=False)
+               if os.path.exists(dropped_path) else None)
+    known   = pd.read_csv(args.known_failures, dtype=str, keep_default_na=False)
+    print(f'Data:    {args.data_dir}\nSplit:   {split_path}\nCatalog: {catalog_path}\n'
+          f'Dropped: {dropped_path}\nKnown failures: {args.known_failures}')
 
     rep = Report()
     check_catalog(rep, catalog, args.min_volume)
     check_split(rep, split, catalog)
     slices = check_files(rep, args.data_dir, split) or {}
+    check_dropped(rep, dropped, known, split)
     check_masks(rep, args.data_dir, split, catalog, args.check_masks, args.workers)
     if args.raw:
-        check_ownership(rep, args.raw, split)
+        check_ownership(rep, args.raw, split, dropped)
     summary(split, catalog, slices)
 
     print(f'\n{"FAILED" if rep.errors else "PASSED"}: {rep.errors} check(s) failed.')

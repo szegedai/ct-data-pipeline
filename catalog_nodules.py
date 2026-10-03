@@ -22,6 +22,7 @@ given with --output), never to the release catalog maintained by process.py.
 Usage:
     python catalog_nodules.py configs/default.toml
     python catalog_nodules.py configs/default.yaml --output unfiltered.csv
+    python catalog_nodules.py configs/release.yaml --set raw_data_path=/data/raw --set save_path=/data/release
 '''
 
 import argparse
@@ -52,6 +53,7 @@ from ct_data_management.processing.writers import (
 )
 from process import (
     load_config,
+    parse_overrides,
     order_runs,
     claim_series,
     DEFAULTS,
@@ -165,18 +167,21 @@ def main():
     parser.add_argument('config', help='Path to a YAML (.yaml/.yml) or TOML (.toml) config file.')
     parser.add_argument('--output', default=None,
                         help='Catalog CSV path (default: <save_path>/nodule_catalog_unfiltered.csv)')
+    parser.add_argument('--set', dest='overrides', action='append', default=[], metavar='KEY=VALUE',
+                        help='Override a config option for every run (as in process.py). Can be repeated.')
     args = parser.parse_args()
 
     raw            = load_config(args.config)
     global_defaults = raw.get('defaults', {})
     runs           = raw.get('runs', [])
+    overrides      = parse_overrides(args.overrides)
 
     if not runs:
         raise SystemExit('Config file must define at least one entry under "runs".')
 
     torch.set_grad_enabled(False)
 
-    cfgs    = [{**DEFAULTS, **global_defaults, **run_override} for run_override in runs]
+    cfgs    = [{**DEFAULTS, **global_defaults, **run_override, **overrides} for run_override in runs]
     ordered = order_runs(cfgs)
 
     owners_by_path = {}

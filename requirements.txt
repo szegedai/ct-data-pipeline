@@ -1,13 +1,19 @@
-# Main ML framework additions
-monai[all]==1.5.1
-
-# Upgrade pyarrow to a NumPy 2.x compatible build (base container ships an old ABI-incompatible version)
-pyarrow>=14.0
-
-# Pipeline-specific packages not provided by the base container
-pandas
-pydicom
+# Versions used to produce the published release (Python 3.13.16; see
+# container/ct-data-pipeline.def, which installs exactly these packages).
+# torch 2.9.1 from PyPI is the CUDA 12.8 build on Linux; it also runs on newer
+# NVIDIA drivers and falls back to the CPU without a GPU.
+torch==2.9.1
+monai==1.5.1
+numpy==2.4.1
+scipy==1.17.0
+pandas==2.2.3
+pyarrow==22.0.0
+pydicom==3.0.1
+nibabel==5.3.3
 dcm2niix==1.0.20250506
-idc-index
-pyyaml
+idc-index==0.11.7
+idc-index-data==23.3.1      # IDC data release v23
+pyyaml==6.0.3
+tqdm==4.67.1
+matplotlib==3.10.8          # view.py and the interactive viewer only
 tomli; python_version < "3.11"

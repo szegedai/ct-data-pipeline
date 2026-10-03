@@ -1,0 +1,68 @@
+Bootstrap: docker
+From: python:3.13.16-slim-bookworm
+
+# Apptainer image with the environment used to produce the published release
+# (process.py, generate_split.py, validate_release.py, catalog_nodules.py): the
+# packages of requirements.txt on Python 3.13.16.  The pipeline code is not
+# copied into the image; run it from a git checkout of this repository, so the
+# commit can be recorded with every run.
+#
+# Build (no GPU needed; ~15 GB of temporary space):
+#   apptainer build --fakeroot ct-data-pipeline.sif container/ct-data-pipeline.def
+#   apptainer test ct-data-pipeline.sif
+#
+# Run (from the repository root; --nv makes the host's NVIDIA driver available):
+#   apptainer exec --nv ct-data-pipeline.sif python process.py configs/release.yaml
+
+%labels
+    Name        ct-data-pipeline
+    Description Environment for producing the harmonised lung CT release
+
+%environment
+    export LC_ALL=C.UTF-8
+    # The home directory is bind-mounted by default; never let packages from
+    # ~/.local shadow the pinned ones below.
+    export PYTHONNOUSERSITE=1
+    export PYTHONDONTWRITEBYTECODE=1
+    export MPLBACKEND=Agg
+
+%post
+    set -eu
+    export PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+    # git: lets the jobs verify and record the commit of the pipeline checkout.
+    apt-get update
+    apt-get install -y --no-install-recommends git ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    python -m pip install "pip==25.3"
+    # The versions of requirements.txt (keep both in sync).  Only prebuilt
+    # wheels: a missing wheel fails the build instead of silently compiling a
+    # different version from source.  torch 2.9.1 from PyPI is the
+    # CUDA 12.8 build; it runs on the nodes' newer driver (CUDA 13.3), which
+    # `apptainer --nv` provides from the host.
+    python -m pip install --only-binary=:all: \
+        torch==2.9.1 \
+        monai==1.5.1 \
+        numpy==2.4.1 \
+        scipy==1.17.0 \
+        pandas==2.2.3 \
+        pyarrow==22.0.0 \
+        pydicom==3.0.1 \
+        nibabel==5.3.3 \
+        dcm2niix==1.0.20250506 \
+        idc-index==0.11.7 \
+        idc-index-data==23.3.1 \
+        pyyaml==6.0.3 \
+        tqdm==4.67.1 \
+        matplotlib==3.10.8
+
+    # Record the exact environment inside the image.
+    python --version > /opt/environment.txt
+    (dcm2niix --version 2>&1 || true) | head -n 3 >> /opt/environment.txt
+    python -m pip freeze >> /opt/environment.txt
+
+%test
+    set -e
+    command -v dcm2niix > /dev/null
+    python -c "import torch, monai, numpy, scipy, pandas, pydicom, nibabel, yaml, tqdm, idc_index, matplotlib.pyplot; print('python', __import__('sys').version.split()[0], '| torch', torch.__version__, '(CUDA', torch.version.cuda, ') | monai', monai.__version__, '| numpy', numpy.__version__, '| pandas', pandas.__version__)"

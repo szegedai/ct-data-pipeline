@@ -245,22 +245,20 @@ def remove_catalog_part(catalog_path: str, series_uid: str) -> None:
         pass
 
 
-def assemble_catalog(catalog_path: str, series_uids) -> dict:
-    """Write ``catalog_path`` from the per-series fragments of ``series_uids``.
+def _assemble_parts(out_path: str, series_uids, columns: list) -> dict:
+    """Write ``out_path`` from the per-series fragments of ``series_uids``.
 
-    Rows are ordered by series UID (and by component order within a series), so
-    the catalogue — and therefore the split generated from it — does not depend
-    on the order in which parallel workers finished.  Fragments of series that
-    are not listed (for example left over from an earlier run with a different
-    configuration) are ignored.
+    Rows are ordered by series UID (and by fragment order within a series), so
+    the result does not depend on the order in which parallel workers finished.
+    Fragments of series that are not listed (for example left over from an
+    earlier run with a different configuration) are ignored.
 
     Returns ``{'series': n_series_with_rows, 'rows': n_rows, 'missing': [uids]}``
-    where ``missing`` lists requested series without a fragment (series that
-    failed, were dropped, or were never processed with this pipeline version).
+    where ``missing`` lists requested series without a fragment.
     """
     rows, missing, n_series = [], [], 0
     for uid in sorted(series_uids):
-        part = catalog_part_path(catalog_path, uid)
+        part = catalog_part_path(out_path, uid)
         if not os.path.exists(part):
             missing.append(uid)
             continue
@@ -270,14 +268,64 @@ def assemble_catalog(catalog_path: str, series_uids) -> dict:
             n_series += 1
             rows.extend(part_rows)
 
-    Path(catalog_path).parent.mkdir(parents=True, exist_ok=True)
-    tmp = catalog_path + '.tmp'
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path + '.tmp'
     with open(tmp, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(tmp, catalog_path)
+    os.replace(tmp, out_path)
     return {'series': n_series, 'rows': len(rows), 'missing': missing}
+
+
+def assemble_catalog(catalog_path: str, series_uids) -> dict:
+    """Write the nodule catalog ``catalog_path`` from its per-series fragments.
+
+    ``missing`` in the returned summary lists series without catalog rows
+    (series that failed, were dropped, or were never processed with this
+    pipeline version).  See ``_assemble_parts``.
+    """
+    return _assemble_parts(catalog_path, series_uids, _CATALOG_COLUMNS)
+
+
+# --- Dropped series report ---
+#
+# Every CT series of a run that is not written to the output — dropped by the
+# data checks (DataAnomalyError) or failed for another reason — is recorded with
+# its dataset and reason in <save_path>/dropped_series.csv, assembled from
+# per-series fragments in the same way as the nodule catalog.
+
+_DROPPED_COLUMNS = ['series_uid', 'dataset', 'reason', 'detail']
+
+
+def dropped_report_path(save_path: str) -> str:
+    return os.path.join(save_path, 'dropped_series.csv')
+
+
+def write_dropped_part(report_path: str, series_uid: str, dataset: str,
+                       reason: str, detail: str) -> None:
+    part = catalog_part_path(report_path, series_uid)
+    Path(part).parent.mkdir(parents=True, exist_ok=True)
+    tmp = f'{part}.{os.getpid()}.tmp'
+    with open(tmp, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=_DROPPED_COLUMNS)
+        writer.writeheader()
+        writer.writerow({'series_uid': series_uid, 'dataset': dataset,
+                         'reason': reason, 'detail': ' '.join(str(detail).split())})
+    os.replace(tmp, part)
+
+
+def remove_dropped_part(report_path: str, series_uid: str) -> None:
+    remove_catalog_part(report_path, series_uid)
+
+
+def assemble_dropped(report_path: str, series_uids) -> dict:
+    """Write the dropped-series report from the fragments of ``series_uids``.
+
+    Series without a fragment were written successfully (or skipped as already
+    processed) and are not part of the report.
+    """
+    return _assemble_parts(report_path, series_uids, _DROPPED_COLUMNS)
 
 
 class NoduleCatalogWriter(PipelinePart):

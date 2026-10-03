@@ -1,0 +1,2 @@
+series_uid,dataset,reason,note
+1.3.6.1.4.1.32722.99.99.215258109030049681741892864948200121270,nsclc_radiomics,RuntimeError,"Source data: dcm2niix converts only 2 of the 116 DICOM files of the series (""Converted 2 of 116 files"")."
