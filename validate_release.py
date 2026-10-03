@@ -39,6 +39,7 @@ import sys
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pandas as pd
@@ -106,12 +107,27 @@ def _npz_shape(path, key='data'):
 
 
 def _mask_components(path):
-    """26-connected components of a nodule mask: (sorted voxel counts, values ok)."""
+    """26-connected components of a nodule mask: (sorted voxel counts, values ok).
+
+    Only the bounding box of the foreground is labelled; it holds every
+    component, so little memory is needed beyond the mask itself, even for long
+    scans.
+    """
     from scipy import ndimage
-    with np.load(path) as f:
-        mask = f['data']
-    values_ok = bool(np.isin(np.unique(mask), (0, 1)).all())
-    labeled, n = ndimage.label(mask[0] > 0, structure=np.ones((3, 3, 3), dtype=bool))
+    with open(path, 'rb') as fh:
+        with np.load(fh) as f:
+            mask = f['data'][0]
+        if hasattr(os, 'posix_fadvise'):    # Linux: drop the file from the page cache
+            os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    fg = mask > 0
+    n_fg = int(np.count_nonzero(fg))
+    values_ok = n_fg == int(np.count_nonzero(mask)) and bool((mask[fg] == 1).all())
+    del mask
+    if n_fg == 0:
+        return [], values_ok
+    lo_hi = [np.flatnonzero(fg.any(axis=tuple(a for a in range(3) if a != ax))) for ax in range(3)]
+    box = fg[tuple(slice(i[0], i[-1] + 1) for i in lo_hi)]
+    labeled, n = ndimage.label(box, structure=np.ones((3, 3, 3), dtype=bool))
     sizes = np.bincount(labeled.ravel())[1:] if n else np.array([], dtype=int)
     return sorted(int(s) for s in sizes), values_ok
 
@@ -265,18 +281,23 @@ def check_masks(rep, data_dir, split, catalog, how, workers, seed=0):
     expected = catalog.groupby('series_uid')['volume_mm3'].apply(lambda v: sorted(round(x) for x in v))
     jobs = [(u, os.path.join(data_dir, 'nodule_sem_seg_3d', f'{u}.npz')) for u in uids]
     wrong_count, wrong_volume, not_binary, errors = [], [], [], []
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        for uid, sizes, values_ok, err in pool.map(_mask_job, jobs, chunksize=4):
-            if err:
-                errors.append(f'{uid}: {err}')
-                continue
-            if not values_ok:
-                not_binary.append(uid)
-            exp = expected.get(uid, [])
-            if len(sizes) != len(exp):
-                wrong_count.append(f'{uid}: {len(sizes)} components on disk, {len(exp)} in catalog')
-            elif sizes != exp:
-                wrong_volume.append(f'{uid}: volumes {sizes[:6]} on disk vs {exp[:6]} in catalog')
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            for uid, sizes, values_ok, err in pool.map(_mask_job, jobs, chunksize=4):
+                if err:
+                    errors.append(f'{uid}: {err}')
+                    continue
+                if not values_ok:
+                    not_binary.append(uid)
+                exp = expected.get(uid, [])
+                if len(sizes) != len(exp):
+                    wrong_count.append(f'{uid}: {len(sizes)} components on disk, {len(exp)} in catalog')
+                elif sizes != exp:
+                    wrong_volume.append(f'{uid}: volumes {sizes[:6]} on disk vs {exp[:6]} in catalog')
+    except BrokenProcessPool:
+        rep.fail(f'mask check aborted: a worker process was killed (out of memory?); '
+                 f'rerun with fewer --workers (now {workers})')
+        return
     rep.check(not errors, 'all masks readable', f'{len(errors)} masks could not be read', errors)
     rep.check(not not_binary, 'masks are binary (0/1)', f'{len(not_binary)} masks with other values', not_binary)
     rep.check(not wrong_count, 'component count of every mask matches the catalog',
